@@ -1577,56 +1577,6 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const int cc = ggml_cuda_info().devices[id].cc;
 
-    // gfx906: no rocBLAS — dispatch to GEMV (N==1, decode) or tiled GEMM (N>1, prefill/batch).
-    // src1_ddf_i is float* but may alias F16 data when src1->type == GGML_TYPE_F16.
-    if (cc == GGML_CUDA_CC_VEGA20) {
-        const int M = (int)row_diff;
-        const int N = (int)src1_ncols;
-        const int K = (int)ne00;
-
-        if (N == 1) {
-            // GEMV path: one warp per output row, each lane strides K/32 elements.
-            // 8 rows per block × 32 lanes = 256 threads; same occupancy as GEMM.
-            constexpr int ROWS = 8;
-            const dim3 block(32, ROWS);
-            const dim3 grid((M + ROWS - 1) / ROWS);
-            if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
-                vega20_gemv<half, half, ROWS><<<grid, block, 0, stream>>>(
-                    (const half*)src0_dd_i, (const half*)src1_ddf_i, dst_dd_i, M, K, K);
-            } else if (src0->type == GGML_TYPE_F16) {
-                vega20_gemv<half, float, ROWS><<<grid, block, 0, stream>>>(
-                    (const half*)src0_dd_i, src1_ddf_i, dst_dd_i, M, K, K);
-            } else if (src1->type == GGML_TYPE_F16) {
-                vega20_gemv<float, half, ROWS><<<grid, block, 0, stream>>>(
-                    (const float*)src0_dd_i, (const half*)src1_ddf_i, dst_dd_i, M, K, K);
-            } else {
-                vega20_gemv<float, float, ROWS><<<grid, block, 0, stream>>>(
-                    (const float*)src0_dd_i, src1_ddf_i, dst_dd_i, M, K, K);
-            }
-        } else {
-            // GEMM path: 64×64 tiled kernel for prefill / batched requests.
-            const dim3 block(16, 16);                       // (BM/TM, BN/TN) = 256 threads
-            const dim3 grid((M + 63)/64, (N + 63)/64);    // 64×64 output tile per block
-            if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
-                vega20_gemm_tiled<half, half><<<grid, block, 0, stream>>>(
-                    (const half *)src0_dd_i, (const half *)src1_ddf_i, dst_dd_i,
-                    M, N, K, (int)ne00, (int)ne10, (int)ldc);
-            } else if (src0->type == GGML_TYPE_F16) {
-                vega20_gemm_tiled<half, float><<<grid, block, 0, stream>>>(
-                    (const half *)src0_dd_i, src1_ddf_i, dst_dd_i,
-                    M, N, K, (int)ne00, (int)ne10, (int)ldc);
-            } else if (src1->type == GGML_TYPE_F16) {
-                vega20_gemm_tiled<float, half><<<grid, block, 0, stream>>>(
-                    (const float *)src0_dd_i, (const half *)src1_ddf_i, dst_dd_i,
-                    M, N, K, (int)ne00, (int)ne10, (int)ldc);
-            } else {
-                vega20_gemm_tiled<float, float><<<grid, block, 0, stream>>>(
-                    (const float *)src0_dd_i, src1_ddf_i, dst_dd_i,
-                    M, N, K, (int)ne00, (int)ne10, (int)ldc);
-            }
-        }
-        return;
-    }
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
@@ -2667,7 +2617,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
     // gfx906 (Vega20/MI50): rocBLAS has no gfx906 kernels in ROCm 6.0+, disable all cublas paths
-    const bool no_cublas = (cc == GGML_CUDA_CC_VEGA20);
+    const bool no_cublas = false; // Tensile gfx906 from rocBLAS 6.4.3
     if (no_cublas) {
         use_batched_cublas_f16  = false;
         use_batched_cublas_bf16 = false;
@@ -4247,10 +4197,8 @@ static enum ggml_status ggml_backend_cuda_graph_reserve(ggml_backend_t backend, 
     reserving_graph = true;
 
     // Create CuBLAS handles early to avoid synchronous allocations during graph capture.
-    // gfx906 (Vega20/MI50): skip - rocBLAS has no gfx906 kernels in ROCm 6.0+
-    if (ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_VEGA20) {
+    // gfx906: Tensile injected, cublas_handle needed {
         cuda_ctx->cublas_handle();
-    }
 
     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
 
