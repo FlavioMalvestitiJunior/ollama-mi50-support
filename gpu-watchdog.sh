@@ -1,9 +1,11 @@
 #!/bin/bash
 # GPU thermal watchdog for AMD MI50 (gfx906/Vega20) on Proxmox VM
-# Polls every 1s — warns at WARN_TEMP, kills Ollama at CRITICAL_TEMP
+# Polls every 1s — warns at WARN_TEMP, kills Ollama at CRITICAL_TEMP,
+# restarts Ollama automatically when GPU cools below RESUME_TEMP
 
 CRITICAL_TEMP=90
 WARN_TEMP=80
+RESUME_TEMP=45
 POLL_INTERVAL=1
 
 GPU_TEMP_FILE=$(ls /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input 2>/dev/null | head -1)
@@ -15,7 +17,7 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [gpu-watchdog] $*"; }
 
-log "Started. Sensor: $GPU_TEMP_FILE  Warn: ${WARN_TEMP}°C  Critical: ${CRITICAL_TEMP}°C  Poll: ${POLL_INTERVAL}s"
+log "Started. Sensor: $GPU_TEMP_FILE  Warn: ${WARN_TEMP}°C  Critical: ${CRITICAL_TEMP}°C  Resume: ${RESUME_TEMP}°C  Poll: ${POLL_INTERVAL}s"
 
 triggered=false
 warned=false
@@ -42,12 +44,17 @@ while true; do
         fi
         triggered=false
     else
-        if [ "$triggered" = true ]; then
-            log "GPU resfriou para ${temp}°C — reinicie o ollama manualmente: systemctl start ollama"
+        if [ "$triggered" = true ] && [ "$temp" -le "$RESUME_TEMP" ]; then
+            log "GPU resfriou para ${temp}°C — reiniciando ollama.service"
+            systemctl start ollama
+            triggered=false
+            warned=false
+            last_warn_temp=0
         fi
-        triggered=false
-        warned=false
-        last_warn_temp=0
+        if [ "$triggered" = false ]; then
+            warned=false
+            last_warn_temp=0
+        fi
     fi
 
     sleep "$POLL_INTERVAL"
