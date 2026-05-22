@@ -93,6 +93,8 @@ Other models on GPU:
 | `solve_tri.cu` | `.../ggml-cuda/solve_tri.cu` | Triangular solve bypass for gfx906 |
 | `CMakeLists.txt` | `/home/llm/ollama-hip-build/CMakeLists.txt` | Build file with all compile definitions |
 | `ollama-rocm.conf` | `/etc/systemd/system/ollama.service.d/rocm.conf` | Ollama service environment configuration |
+| `gpu-watchdog.sh` | `/usr/local/bin/gpu-watchdog.sh` | Thermal watchdog — kills Ollama at ≥90°C, warns at ≥80°C |
+| `gpu-bench.sh` | `/usr/local/bin/gpu-bench.sh` | Benchmark wrapper with inter-run thermal cooldown (<45°C) |
 
 All source files are from the Ollama 0.24.0 fork at `/home/llm/ollama-src/`.
 
@@ -233,9 +235,60 @@ Adding `-DGCN` as a compile definition would select 64-thread warp_size in the d
 
 ---
 
+## Thermal Management
+
+The MI50 under PCIe passthrough in a VM can reach 90–94°C under sustained inference load (DPM/clock management is limited in virtualized environments). Two tools are included to mitigate this:
+
+### GPU Watchdog (`gpu-watchdog.sh`)
+
+A systemd service that polls the GPU temperature sensor every **1 second**:
+
+- **≥ 80°C**: logs a warning to the journal (`journalctl -u gpu-watchdog -f`)
+- **≥ 90°C**: runs `systemctl stop ollama` to halt all GPU processing immediately
+- Ollama does **not** restart automatically — restart manually once the GPU has cooled:
+
+```bash
+sudo systemctl restart ollama
+```
+
+Install (already done on the VM):
+```bash
+sudo cp gpu-watchdog.sh /usr/local/bin/gpu-watchdog.sh
+sudo chmod +x /usr/local/bin/gpu-watchdog.sh
+sudo cp gpu-watchdog.service /etc/systemd/system/
+sudo systemctl enable --now gpu-watchdog
+```
+
+Monitor the watchdog live:
+```bash
+journalctl -u gpu-watchdog -f
+```
+
+### Benchmark Cooldown (`gpu-bench.sh`)
+
+Runs Ollama benchmarks with automatic inter-run cooldown:
+
+```bash
+gpu-bench.sh [model] [prompt] [runs]
+# Example:
+gpu-bench.sh gemma4:31b "What is 2+2?" 3
+```
+
+Between each run, if the GPU is above **45°C**, it waits in 30-second intervals until the temperature drops. This prevents thermal compounding across benchmark runs.
+
+### Check GPU temperature
+
+```bash
+cat /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input | awk '{print $1/1000 "°C"}'
+```
+
+---
+
 ## Infrastructure Reference (VM)
 
 - Ollama source: `/home/llm/ollama-src/`
 - Build dir: `/home/llm/ollama-hip-build/`
 - Installed lib: `/usr/local/lib/ollama/rocm/libggml-hip.so`
 - Service override: `/etc/systemd/system/ollama.service.d/rocm.conf`
+- GPU watchdog: `/usr/local/bin/gpu-watchdog.sh` + `/etc/systemd/system/gpu-watchdog.service`
+- Benchmark script: `/usr/local/bin/gpu-bench.sh`
