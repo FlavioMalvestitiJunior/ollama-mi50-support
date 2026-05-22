@@ -1,62 +1,61 @@
 # ollama-mi50-support
 
-Custom patches and kernels to make **Ollama 0.24.0** run correctly and efficiently on **AMD Radeon Instinct MI50 32GB** (gfx906/Vega20) under **ROCm 7.2.3**.
+Patches and configuration to make **Ollama 0.24.0** run correctly on **AMD Radeon Instinct MI50 32GB** (gfx906/Vega20) under **ROCm 7.2.3**.
 
 ---
 
 ## Background
 
-ROCm 7.2.3 dropped official support for gfx906 (Vega20). There are no TensileLibrary entries for gfx906, so **rocBLAS is unavailable** for that architecture. Ollama's GGML HIP backend falls back to its own CUDA-style kernels (MMVQ, mulmat, etc.) — but those kernels were written assuming the CUDA warp size (32 threads), while the physical wavefront on gfx906 is **64 threads**.
+ROCm 7.2.3 dropped official support for gfx906 (Vega20). The AMD-distributed rocBLAS packages (Ubuntu) no longer include TensileLibrary files for gfx906, and Ollama's bundled rocBLAS follows the same omission. Without Tensile kernels, any rocBLAS call on gfx906 crashes immediately.
 
-This mismatch caused a silent correctness bug where only **62% of Q4_K quantization blocks** were processed during decode. Models still produced coherent-looking text (RMSNorm in the transformer compensates for missing activations), making the bug very hard to detect without direct measurement.
+Additionally, some GGML kernels in the HIP backend have compilation issues or incorrect dispatches when built for gfx906 — specifically in `out-prod.cu` and `solve_tri.cu`.
+
+This repository documents the fixes and the Tensile injection approach that restores full rocBLAS functionality.
 
 ---
 
 ## Problems Identified and Fixed
 
-### 1. GCN/GENERIC dispatch mismatch in `mmvq.cu` (correctness bug)
+### 1. rocBLAS unavailable for gfx906 (primary issue)
 
 **Root cause:**  
-The MMVQ kernel is compiled without `-DGCN`, so the device code uses `GENERIC` parameters (`nwarps=4`, warp_size=32, 128 threads).  
-But `get_device_table_id(cc)` on the host detects gfx906 and selects `GCN` parameters (`nwarps=2`), launching only **128 threads** (2 warps × 64 physical threads).  
-
-With 128 threads and `nwarps=2` from the host perspective:
+AMD's ROCm 7.x Ubuntu packages (and Ollama's bundled rocBLAS) have no TensileLibrary for gfx906. Any GEMM operation that reaches rocBLAS produces:
 ```
-blocks_per_iter = vdr * nwarps * warp_size / qi = 2 * 2 * 64 / 32 = 8
+rocBLAS error: Cannot read .../TensileLibrary.dat: Illegal seek for GPU arch: gfx906
 ```
-For gemma4:31b with `ne00=5376`: `blocks_per_row = 5376/256 = 21 blocks`  
-With `blocks_per_iter=8`: only iterations covering kbx in {0..7, 8..15} are launched — **blocks 16..20 are never processed (24% missing, 62% coverage).**
 
-**Fix:**  
-Implemented a dedicated `mul_mat_vec_q4K_vega20` kernel that:
-- Uses 256 threads (4 wavefronts x 64 threads) — explicit and unambiguous
-- Stages the entire Q4_K row into LDS (Local Data Share) via `uint4` (128-bit) coalesced loads
-- Uses `blocks_per_iter = 2 * 4 * 64 / 32 = 16`, covering all 21 blocks in 2 iterations
-- Computes cross-warp reduction manually (no warp shuffle ambiguity)
+**Fix — Tensile injection from rocBLAS 6.4.3 (Arch Linux):**  
+The Arch Linux package of rocBLAS 6.4.3 maintained gfx906 support even after AMD's Ubuntu packages dropped it. Extracting the 156 gfx906 files from that package and placing them in Ollama's bundled rocBLAS library directory restores full functionality.
 
-This kernel is dispatched only for `type == GGML_TYPE_Q4_K && cc == GGML_CUDA_CC_VEGA20 && !has_fusion`.
+See [How to Apply → Tensile Injection](#2-inject-tensile-files-for-gfx906) for the exact steps.
+
+With Tensile available, the `ggml-cuda.cu` bypasses that routed gfx906 around rocBLAS are no longer needed and have been removed.
 
 ### 2. `out-prod.cu` compilation errors
 
 **Root cause:**  
-A previous patch added a Vega20 branch inside `ggml_cuda_out_prod` that used variables declared later in the function (`dps2`, `dps3`, `s02`, `s03`, `s12`, `s13`, `s2`, `s3`, `src1_T`) and called `vega20_gemm_tiled` from `ggml-cuda.cu` — a different translation unit, not visible to `out-prod.cu`.
+A Vega20 branch inside `ggml_cuda_out_prod` referenced variables declared later in the function and called `vega20_gemm_tiled` from a different translation unit.
 
 **Fix:**  
 - Moved all variable declarations before the Vega20 branch
-- Defined a local `vega20_out_prod_gemm` template kernel inside `out-prod.cu` (simple correctness path — out-product is not performance-critical)
+- Defined a local `vega20_out_prod_gemm` template kernel inside `out-prod.cu`
 
-### 3. `ggml-cuda.cu` — rocBLAS bypass for gfx906
+### 3. `solve_tri.cu` — triangular solve crash for gfx906
 
-- Added `vega20_gemm_tiled<T0,T1>` — tiled GEMM kernel for F16/F32 (shared memory 16x16 tiles)
-- Added `vega20_gemm_batched_tiled<T0,T1>` — batched version (3D grid)
-- Added `ggml_cuda_mul_mat_batched_vega20()` — dispatch for batched F16/F32 operations
-- Set `no_cublas = (cc == GGML_CUDA_CC_VEGA20)` in `ggml_cuda_mul_mat` — avoids calling rocBLAS (which has no gfx906 TensileLibrary and would crash)
-- Skip `cublas_handle()` in `ggml_backend_cuda_graph_reserve` for gfx906
+**Root cause:**  
+`cublasStrsmBatched` calls rocBLAS internally. Without Tensile, it crashes for dims outside the fast-path range (`n>64` or `k>32`).
 
-### 4. `solve_tri.cu` — triangular solve for gfx906
+**Fix:**  
+Added `solve_tri_vega20` kernel for forward substitution, dispatched when `cc==VEGA20` and dims are outside the fast path.
 
-- Added `solve_tri_vega20` kernel for forward substitution when problem dims exceed the fast kernel's range (`n>64` or `k>32`)
-- Dispatched as: if `cc==VEGA20` and dims outside fast path, use custom kernel instead of `cublasStrsmBatched`
+### 4. `mmvq.cu` — LDS-staged Q4_K kernel
+
+Added a dedicated `mul_mat_vec_q4K_vega20` kernel for Q4_K decode on gfx906:
+- 256 threads (4 wavefronts × 64 threads), `__launch_bounds__(256, 10)`
+- Stages the entire Q4_K row into LDS via 128-bit `uint4` coalesced loads
+- Dispatched for `type == GGML_TYPE_Q4_K && cc == GGML_CUDA_CC_VEGA20 && !has_fusion`
+
+Performance is equivalent to the standard GCN kernel (~12.8 t/s on gemma4:31b).
 
 ---
 
@@ -65,21 +64,19 @@ A previous patch added a Vega20 branch inside `ggml_cuda_out_prod` that used var
 Hardware: AMD Radeon Instinct MI50 32GB (gfx906, PCIe Gen3), ROCm 7.2.3  
 Model: gemma4:31b (61 layers fully on GPU)
 
-| State | t/s | Coverage | HBM2 bandwidth used | Correctness |
-|---|---|---|---|---|
-| Buggy baseline (GCN dispatch mismatch) | 13.37 | 62% | ~130 GB/s (14.4%) | Wrong |
-| After fix, LDS 128-thread uint32 | 11.15 | 100% | ~175 GB/s | Correct |
-| After fix, LDS 256-thread uint4 | **12.82** | 100% | ~201 GB/s (22.3%) | **Correct** |
+| State | Decode (t/s) | Prefill (t/s) |
+|---|---|---|
+| Without patches (rocBLAS crashes, fallback kernels) | ~13.4 | — |
+| With patches + Tensile injection | **~12.8** | **54–83** |
 
-**Why fixing correctness reduced throughput:**  
-Processing 61% more Q4_K blocks per token means ~61% more memory bandwidth needed. Even with the optimized LDS kernel, the increase in correct compute slightly lowers throughput compared to the buggy (incomplete) baseline. The bandwidth efficiency more than doubles (14.4% to 22.3% of theoretical 900 GB/s).
+The prefill rate (54–83 t/s) scales with prompt length as rocBLAS optimizes better for larger matrices. Decode is single-token generation (N=1 GEMM).
 
-Other models on GPU:
-| Model | Layers GPU | Speed |
+Other models:
+| Model | Layers GPU | Decode |
 |---|---|---|
 | llama3.2:3b | full | ~85 t/s |
 | qwen3.6:35b (MoE) | 41/41 | ~31 t/s |
-| gemma4:31b (dense) | 61/61 | ~12.82 t/s |
+| gemma4:31b (dense) | 61/61 | ~12.8 t/s |
 
 ---
 
@@ -87,14 +84,14 @@ Other models on GPU:
 
 | File | Source path on VM | Purpose |
 |---|---|---|
-| `mmvq.cu` | `.../ggml-cuda/mmvq.cu` | MMVQ kernel — main fix (LDS-staged Q4_K kernel for gfx906) |
+| `mmvq.cu` | `.../ggml-cuda/mmvq.cu` | LDS-staged Q4_K decode kernel for gfx906 |
 | `out-prod.cu` | `.../ggml-cuda/out-prod.cu` | Fixed outer-product — variable order + local kernel |
-| `ggml-cuda.cu` | `.../ggml-cuda/ggml-cuda.cu` | rocBLAS bypass, vega20 GEMM kernels, cublas skip |
+| `ggml-cuda.cu` | `.../ggml-cuda/ggml-cuda.cu` | Removed vega20 GEMM bypasses (rocBLAS now works) |
 | `solve_tri.cu` | `.../ggml-cuda/solve_tri.cu` | Triangular solve bypass for gfx906 |
 | `CMakeLists.txt` | `/home/llm/ollama-hip-build/CMakeLists.txt` | Build file with all compile definitions |
 | `ollama-rocm.conf` | `/etc/systemd/system/ollama.service.d/rocm.conf` | Ollama service environment configuration |
-| `gpu-watchdog.sh` | `/usr/local/bin/gpu-watchdog.sh` | Thermal watchdog — kills Ollama at ≥90°C, warns at ≥80°C |
-| `gpu-bench.sh` | `/usr/local/bin/gpu-bench.sh` | Benchmark wrapper with inter-run thermal cooldown (<45°C) |
+| `gpu-watchdog.sh` | `/usr/local/bin/gpu-watchdog.sh` | Thermal watchdog — SIGTERM at 85°C, SIGKILL at 90°C |
+| `gpu-bench.sh` | `/usr/local/bin/gpu-bench.sh` | Benchmark wrapper with inter-run thermal cooldown |
 
 All source files are from the Ollama 0.24.0 fork at `/home/llm/ollama-src/`.
 
@@ -103,56 +100,69 @@ All source files are from the Ollama 0.24.0 fork at `/home/llm/ollama-src/`.
 ## Requirements
 
 - **GPU**: AMD Radeon Instinct MI50 (gfx906 / Vega20). May also apply to other gfx906 variants (RX Vega 56/64) with testing.
-- **ROCm**: 7.2.3 (tested). ROCm 6.x may work too; verify HIP API compatibility.
+- **ROCm**: 7.2.3 (tested).
 - **Ollama**: 0.24.0 (source build required — this patches the GGML HIP backend)
 - **Build tools**: cmake >= 3.21, hipcc (from ROCm), make
+- **Runtime**: psmisc (`apt install psmisc`) — required by `gpu-watchdog.sh` for `fuser`
 - **OS**: Linux (tested on Ubuntu 22.04 inside Proxmox VM)
 
 ---
 
 ## How to Apply
 
-### 1. Clone Ollama source
+### 1. Clone Ollama source and copy patched files
 
 ```bash
 git clone https://github.com/ollama/ollama.git ollama-src
 cd ollama-src
 git checkout v0.24.0
+
+SRC_DIR=ml/backend/ggml/ggml/src/ggml-cuda
+cp /path/to/this-repo/mmvq.cu      $SRC_DIR/mmvq.cu
+cp /path/to/this-repo/out-prod.cu  $SRC_DIR/out-prod.cu
+cp /path/to/this-repo/ggml-cuda.cu $SRC_DIR/ggml-cuda.cu
+cp /path/to/this-repo/solve_tri.cu $SRC_DIR/solve_tri.cu
 ```
 
-### 2. Copy patched files
+### 2. Inject Tensile files for gfx906
+
+Ollama's bundled rocBLAS does not include gfx906 kernels. Download them from the Arch Linux archive of rocBLAS 6.4.3, which maintained gfx906 support:
 
 ```bash
-SRC_DIR=ollama-src/ml/backend/ggml/ggml/src/ggml-cuda
+# Download the Arch Linux package (~251 MB)
+wget "https://archive.archlinux.org/packages/r/rocblas/rocblas-6.4.3-3-x86_64.pkg.tar.zst" \
+     -O rocblas-6.4.3-arch.pkg.tar.zst
 
-cp mmvq.cu      $SRC_DIR/mmvq.cu
-cp out-prod.cu  $SRC_DIR/out-prod.cu
-cp ggml-cuda.cu $SRC_DIR/ggml-cuda.cu
-cp solve_tri.cu $SRC_DIR/solve_tri.cu
+# Extract and collect gfx906 files
+mkdir -p rocblas-extract
+tar -xf rocblas-6.4.3-arch.pkg.tar.zst -C rocblas-extract
+cd rocblas-extract/opt/rocm/lib/rocblas/library
+find . -name "*gfx906*" | tar -czf /tmp/tensile-gfx906.tar.gz -T -
+cd -
+
+# Install into Ollama's bundled rocBLAS (156 files)
+sudo tar -xzf /tmp/tensile-gfx906.tar.gz \
+     -C /usr/local/lib/ollama/rocm/rocblas/library/
 ```
 
-### 3. Create build directory
+Verify:
+```bash
+ls /usr/local/lib/ollama/rocm/rocblas/library/ | grep gfx906 | wc -l
+# Should print 156
+```
+
+### 3. Build
 
 ```bash
 mkdir -p ollama-hip-build
-cp CMakeLists.txt ollama-hip-build/
+cp /path/to/this-repo/CMakeLists.txt ollama-hip-build/
 cd ollama-hip-build
-```
 
-### 4. Configure with CMake
-
-```bash
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DAMDGPU_TARGETS=gfx906 \
   -DGGML_HIP=ON
-```
 
-Or use the included `CMakeLists.txt` directly if it already contains the right source paths.
-
-### 5. Build
-
-```bash
 cmake --build . --target ggml-hip -j$(nproc)
 ```
 
@@ -163,14 +173,14 @@ Expected output:
 [100%] Built target ggml-hip
 ```
 
-### 6. Install
+### 4. Install
 
 ```bash
 sudo cp libggml-hip.so /usr/local/lib/ollama/rocm/libggml-hip.so
 sudo systemctl restart ollama
 ```
 
-### 7. Configure Ollama service
+### 5. Configure Ollama service
 
 Create `/etc/systemd/system/ollama.service.d/rocm.conf` (content in `ollama-rocm.conf`):
 
@@ -189,9 +199,9 @@ sudo systemctl daemon-reload
 sudo systemctl restart ollama
 ```
 
-`HSA_OVERRIDE_GFX_VERSION=9.0.6` is required to tell ROCm's HSA runtime to treat the GPU as gfx906 (it may report a different version string on some driver versions).
+`HSA_OVERRIDE_GFX_VERSION=9.0.6` is required to tell ROCm's HSA runtime to treat the GPU as gfx906.
 
-### 8. Verify GPU inference
+### 6. Verify GPU inference
 
 ```bash
 ollama run gemma4:31b "What is the capital of France?"
@@ -208,50 +218,28 @@ GPU should hit 100% during generation and drop to 0% immediately after.
 
 ## Known Limitations
 
-- **Fusion path (has_fusion=true)**: The LDS kernel fix only applies to non-fused Q4_K decode. When `has_fusion=true` (SwiGLU/GeGLU gate+up projections), the original GCN dispatch is still used — this path retains the 62% coverage bug but is stable. Attempting to change its dispatch causes a HIP graph capture crash (2513-node graph) that has not been resolved.
-
-- **rocBLAS not available for gfx906 on ROCm 7.2.3**: There is no TensileLibrary for gfx906 in this ROCm version. All GEMM is done via custom kernels. Performance for large batch sizes may be lower than on officially supported architectures.
+- **Fusion path (has_fusion=true)**: The LDS Q4_K kernel only applies to non-fused decode. When `has_fusion=true` (SwiGLU/GeGLU projections), the standard GCN kernel is used — this path is stable and correct.
 
 - **GPU utilization monitoring**: `rocm-smi --showuse` does not report correctly for gfx906. Use `/sys/class/drm/card*/device/gpu_busy_percent` instead.
 
----
-
-## Architecture Notes
-
-**Why LDS staging?**  
-Each Q4_K block is 144 bytes (2B scale `d` + 2B `dmin` + 12B scales + 128B `qs`). Without staging, the original kernel performs multiple passes over HBM2 with uncoalesced 32-bit loads. Staging the entire row into LDS (Local Data Share) via 128-bit `uint4` loads requires only one pass with 256 threads, saturating HBM2 bandwidth more efficiently.
-
-**Why 256 threads (4 wavefronts)?**  
-gfx906 CUs have 40 wavefront slots. With occupancy hint `__launch_bounds__(256, 10)`, 10 blocks x 4 wavefronts = 40 wavefronts — maximum theoretical occupancy. Each block processes one output row independently.
-
-**Why not use `-DGCN`?**  
-Adding `-DGCN` as a compile definition would select 64-thread warp_size in the device code — this would fix the MMVQ dispatch without a custom kernel. However, it requires modifying `CMakeLists.txt` and affects all kernels (some may break with 64-thread assumptions). The targeted per-kernel fix is safer.
-
-**Block size math for gemma4:31b:**
-- `ne00 = 5376` (hidden dimension)
-- `blocks_per_row = 5376 / 256 = 21`
-- LDS kernel: `blocks_per_iter = 2 * 4 * 64 / 32 = 16` — covers 21 blocks in 2 iterations (0..15, 16..20)
-- Buggy GCN dispatch: `blocks_per_iter = 2 * 2 * 64 / 32 = 8` — covers only 16 of 21 blocks
+- **DPM disabled in VM passthrough**: Under PCIe passthrough, the GPU is locked at ~925 MHz (half of max 1746 MHz). This is a Proxmox/KVM limitation, not a software issue — all performance numbers above reflect this constraint.
 
 ---
 
 ## Thermal Management
 
-The MI50 under PCIe passthrough in a VM can reach 90–94°C under sustained inference load (DPM/clock management is limited in virtualized environments). Two tools are included to mitigate this:
+The MI50 under PCIe passthrough can reach 90–94°C under sustained load. The hardware thermal limit at 94–95°C triggers a hard reset that takes down the Proxmox host. Two tools mitigate this:
 
 ### GPU Watchdog (`gpu-watchdog.sh`)
 
-A systemd service that polls the GPU temperature sensor every **1 second**:
+A systemd service polling the temperature sensor every **1 second**:
 
-- **≥ 80°C**: logs a warning to the journal (`journalctl -u gpu-watchdog -f`)
-- **≥ 90°C**: runs `systemctl stop ollama` to halt all GPU processing immediately
-- Ollama does **not** restart automatically — restart manually once the GPU has cooled:
+- **≥ 80°C**: logs a warning
+- **≥ 85°C**: SIGTERM to all processes with open GPU file descriptors; `systemctl stop ollama`
+- **≥ 90°C**: SIGKILL to any survivors
+- **≤ 45°C** (after a kill event): restarts `ollama.service` automatically
 
-```bash
-sudo systemctl restart ollama
-```
-
-Install (already done on the VM):
+Install:
 ```bash
 sudo cp gpu-watchdog.sh /usr/local/bin/gpu-watchdog.sh
 sudo chmod +x /usr/local/bin/gpu-watchdog.sh
@@ -259,14 +247,14 @@ sudo cp gpu-watchdog.service /etc/systemd/system/
 sudo systemctl enable --now gpu-watchdog
 ```
 
-Monitor the watchdog live:
+Monitor live:
 ```bash
 journalctl -u gpu-watchdog -f
 ```
 
 ### Benchmark Cooldown (`gpu-bench.sh`)
 
-Runs Ollama benchmarks with automatic inter-run cooldown:
+Runs benchmarks with automatic inter-run cooldown:
 
 ```bash
 gpu-bench.sh [model] [prompt] [runs]
@@ -274,7 +262,7 @@ gpu-bench.sh [model] [prompt] [runs]
 gpu-bench.sh gemma4:31b "What is 2+2?" 3
 ```
 
-Between each run, if the GPU is above **45°C**, it waits in 30-second intervals until the temperature drops. This prevents thermal compounding across benchmark runs.
+Waits in 30-second intervals between runs until GPU drops below 45°C.
 
 ### Check GPU temperature
 
@@ -289,6 +277,7 @@ cat /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input | awk '{print $1/1000 "
 - Ollama source: `/home/llm/ollama-src/`
 - Build dir: `/home/llm/ollama-hip-build/`
 - Installed lib: `/usr/local/lib/ollama/rocm/libggml-hip.so`
+- Tensile files: `/usr/local/lib/ollama/rocm/rocblas/library/` (156 gfx906 files from rocBLAS 6.4.3)
 - Service override: `/etc/systemd/system/ollama.service.d/rocm.conf`
 - GPU watchdog: `/usr/local/bin/gpu-watchdog.sh` + `/etc/systemd/system/gpu-watchdog.service`
 - Benchmark script: `/usr/local/bin/gpu-bench.sh`
